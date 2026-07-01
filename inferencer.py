@@ -178,7 +178,15 @@ class InterleaveInferencer:
         latent = latent.reshape(1, h, w, self.model.latent_patch_size, self.model.latent_patch_size, self.model.latent_channel)
         latent = torch.einsum("nhwpqc->nchpwq", latent)
         latent = latent.reshape(1, self.model.latent_channel, h * self.model.latent_patch_size, w * self.model.latent_patch_size)
-        image = self.vae_model.decode(latent)
+        # Align latent to the VAE's actual weight dtype/device and run decode
+        # outside autocast: callers may wrap gen_image in torch.autocast, which
+        # can leave the latent as float32 while autocast-cast VAE conv weights
+        # are bfloat16 (or vice-versa). Disabling autocast here makes decode use
+        # the VAE's real stored dtype consistently.
+        _vae_p = next(self.vae_model.parameters())
+        latent = latent.to(device=_vae_p.device, dtype=_vae_p.dtype)
+        with torch.autocast(device_type=_vae_p.device.type, enabled=False):
+            image = self.vae_model.decode(latent)
         image = (image * 0.5 + 0.5).clamp(0, 1)[0].permute(1, 2, 0) * 255
         image = Image.fromarray((image).to(torch.uint8).cpu().numpy())
 
