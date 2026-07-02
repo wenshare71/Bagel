@@ -158,3 +158,240 @@ warm-up (N=50, CFG on) FAILED: RuntimeError('Input type (float) and bias type (c
 - `DEBUG_NOTES.md` — 本文档
 
 未跟踪文件(`BAGEL-7B-MoT/` 模型权重、`output_*.png`、`run_inference.py`、`requirements_infer.txt`)不纳入本次提交。`.gitignore` 与 `inference.ipynb` 的既有改动也不属于本次诊断范围,不在本次提交内。
+
+---
+
+## 7. `think_cap_benchmark.ipynb` OOM 问题 (2026-07-02)
+
+### 现象
+
+cell-14 warm-up 报错：
+
+```
+FAILED: OutOfMemoryError('CUDA out of memory. Tried to allocate 1024.00 MiB.
+GPU 0 has a total capacity of 23.65 GiB of which 692.50 MiB is free.
+Process 56131 has 10.73 GiB memory in use.
+Process 209081 has 12.23 GiB memory in use.
+```
+
+### 根因
+
+**两个 Jupyter kernel 同时在 GPU 上加载了模型。**
+
+| Kernel | 用途 | 显存占用 |
+|--------|------|----------|
+| PID 195457 | `think_bottleneck_benchmark.ipynb`(已跑完 162/162,未关闭) | ~11 GiB |
+| PID 247936 | `think_cap_benchmark.ipynb`(warmup 阶段) | ~12 GiB |
+
+GPU 0 总共 23.65 GiB,两个模型进程合计 ~23 GiB,没有剩余空间。
+
+### 修复
+
+#### 手动操作(必须)
+在 Jupyter 界面关闭 `think_bottleneck_benchmark.ipynb` 的 kernel,或 `kill 195457`。
+
+#### 代码防护(已应用)
+对 `think_cap_benchmark.ipynb` 做了三层防御:
+
+1. **cell-2**:添加 `os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")` + `import gc`,按 PyTorch 官方建议缓解碎片化。
+2. **cell-10** (`run_trial`):`finally` 块中显式 `del gen_context, cfg_text_context, cfg_img_context` + `gc.collect()` + `torch.cuda.empty_cache()`,确保每 trial 后释放三个 KV cache 的引用。
+3. **cell-17** (sweep 循环):每 20 trial checkpoint 时额外 `gc.collect()` + `torch.cuda.empty_cache()`,防御 Python GC 滞后。
+
+#### 不改的
+- `inferencer.py` `gen_text()` 中的 `deepcopy(gen_context)` 是必需的——`generate_text` 的 autoregressive 循环会在原地修改 `past_key_values`,调用方依赖原始 context 不被污染来执行后续 `update_context_text`。
+
+---
+
+## 8. 多卡并行 sweep: 从 3h 到 ~50min 的完整踩坑记录 (2026-07-02)
+
+### 8.1 动机
+
+`think_cap_benchmark.ipynb` 有 480 trials，单进程跑 ~3h。本机 8×4090，想用多卡并行加速。
+
+### 8.2 GPU 拓扑
+
+```
+GPU0 GPU1 GPU2 GPU3 GPU4 GPU5 GPU6 GPU7
+  X  SYS  SYS  SYS  SYS  SYS  SYS  SYS   ← 全 SYS (PCIe), 无 P2P/NVLink
+```
+
+**结论**：多卡分载一个模型 → 每次 forward 跨 PCIe，慢。但多卡各跑各的 → 无通信开销，线性加速。
+
+### 8.3 问题一：模型单卡装不下
+
+**现象**：最初尝试 8×单卡并行（`--gpus-per-worker 1`），8 个 worker 全部 OOM。
+
+```
+RuntimeError: CUDA error: out of memory
+model = model.to(dtype=torch.bfloat16, device="cuda:0").eval()
+```
+
+**根因**：`ema.safetensors` 磁盘上 28 GB（fp32 存储），即使用 `load_file(device="cpu")` + `model.to(bf16)` 转精度，实际模型 + VAE + ViT + connectors 在 GPU 上也占用 ~16-18 GB。加上 denoising forward pass 需要额外 ~4-6 GB 临时空间（1024×1024 分辨率，4096 image tokens），单卡 24 GB 不够。
+
+**修复**：改为 `--gpus-per-worker 2`，8 卡 → 4 个并行 worker，每 worker 用 accelerate device_map 跨 2 卡分载。
+
+### 8.4 问题二：CUDA_VISIBLE_DEVICES 在 spawn 子进程中不生效
+
+**现象**：用 `multiprocessing.spawn` 启动 worker，`worker_main` 第一行设置 `os.environ["CUDA_VISIBLE_DEVICES"]`，但所有 worker 仍然挤在 GPU 0 上。
+
+**根因**：`spawn` 子进程会重新执行模块顶层代码，`import torch` 发生在 `worker_main` 之前。此时环境变量还没设置，torch 已经初始化在默认 GPU 上了。
+
+**修复**：改用 `subprocess.Popen` 启动 worker，通过 `env` 参数传入 `CUDA_VISIBLE_DEVICES`。subprocess 在 fork 前就设好环境变量，子进程从第一行代码（包括 `import torch`）就正确看到隔离的 GPU。
+
+```python
+# 关键代码
+env = os.environ.copy()
+env["CUDA_VISIBLE_DEVICES"] = gpu_str  # e.g. "2,3"
+p = subprocess.Popen(cmd, env=env)
+```
+
+### 8.5 问题三：infer_auto_device_map 把层 offload 到 disk（性能灾难）
+
+**现象**：dtype 修复后 warmup 成功但极慢 — `t_think=264s`（正常 ~9s，慢 29×）。
+
+device_map 输出：
+```
+layers 0-9  → GPU0
+layers 10-21 → GPU1
+layers 22-27 → disk      ← 6 层被卸到磁盘！
+lm_head     → disk
+vit_model   → disk
+```
+
+每次 forward pass 都需要从磁盘 swap 这 6 层 + lm_head + vit，IO 延迟完全摧毁了性能。
+
+**根因**：`infer_auto_device_map` 默认按 **fp32** 估算模型大小（28 GB），但实际加载时 `load_checkpoint_and_dispatch(dtype=torch.bfloat16)` 只占用 ~14 GB。accelerate 误以为 2 卡装不下，就把多余的卸到 disk。
+
+**修复**：在 `infer_auto_device_map` 中传入 `dtype=torch.bfloat16`：
+
+```python
+device_map = infer_auto_device_map(
+    model,
+    max_memory={i: max_mem_per_gpu for i in range(gpu_count)},
+    no_split_module_classes=["Bagel", "Qwen2MoTDecoderLayer"],
+    dtype=torch.bfloat16,  # ← 告知真实加载精度
+)
+```
+
+### 8.6 问题四：accelerate 分层严重不均衡（再次 OOM）
+
+**现象**：加了 `dtype=bf16` 后，4 个 worker warmup 全部 OOM。
+
+```
+GPU 0: layers 0-23 (24 layers) → 23.42 GiB / 23.65 GiB  ← 几乎满了
+GPU 1: layers 24-27 (4 layers) + norm/lm_head/vit → ~10 GiB  ← 浪费
+```
+
+warmup 阶段 gen_image 需要额外临时空间做 denoising forward pass，GPU 0 只剩 ~200 MiB，直接炸了。
+
+**根因**：`max_mem_per_gpu="23GiB"` 设置太高，accelerate 倾向于尽量塞满第一张卡再往第二张放。24/28 层全压在 GPU 0 上，留给 forward pass 的工作空间不够。
+
+**修复**：抛弃 `infer_auto_device_map`，**手动构建均衡的 device_map**：
+
+```python
+# 28 层，14 层/卡
+num_layers = 28
+split = 14
+device_map = {}
+
+# LLM layers: 均衡分配
+for layer_idx in range(num_layers):
+    gpu = 0 if layer_idx < split else 1
+    device_map[f"language_model.model.layers.{layer_idx}"] = gpu
+
+# Embed → GPU 0
+device_map["language_model.model.embed_tokens"] = 0
+
+# Norm / lm_head / vit / connectors → GPU 1
+device_map["language_model.model.norm"] = 1
+device_map["language_model.lm_head"] = 1
+device_map["vit_model"] = 1
+# ... etc
+```
+
+预期：
+```
+GPU 0: layers 0-13 + embed → ~7 GB, 留 15+ GB 给 forward pass
+GPU 1: layers 14-27 + norm/lm_head/vit/connectors → ~9 GB, 留 13+ GB
+```
+
+### 8.7 辅助改进
+
+在跑多卡 sweep 过程中同步对 notebook 做了这些防御性改动：
+
+| 位置 | 改动 | 作用 |
+|------|------|------|
+| cell-2 | `import gc` + `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` | 缓解碎片化 |
+| cell-4 | `N_ACCELERATE_GPUS = 2` | 限制 accelerate 只用 2 卡 |
+| cell-10 `run_trial` finally | `del gen_context, cfg_text_context, cfg_img_context` + `gc.collect()` | 每 trial 后强制释放 KV cache |
+| cell-17 sweep 循环 | checkpoint 时 `gc.collect()` + GPU empty_cache | 防止 Python GC 滞后 |
+
+### 8.8 最终架构
+
+```
+8 卡 GPU = 4 worker × 2 GPU/worker × 120 trial/worker
+
+Main (PID X)
+├─ subprocess Worker 0: CUDA_VISIBLE_DEVICES=0,1 → accelerate 手动 device_map → 120 trials
+├─ subprocess Worker 1: CUDA_VISIBLE_DEVICES=2,3 → accelerate 手动 device_map → 120 trials
+├─ subprocess Worker 2: CUDA_VISIBLE_DEVICES=4,5 → accelerate 手动 device_map → 120 trials
+└─ subprocess Worker 3: CUDA_VISIBLE_DEVICES=6,7 → accelerate 手动 device_map → 120 trials
+                                ↓
+                        合并 → trials.csv → notebook §9-13 分析
+```
+
+### 8.9 问题五：手动 device_map 跨设备冲突
+
+**现象**：4 个 worker warmup 立即报错（denoising 进度条 0/49）：
+
+```
+RuntimeError: Expected all tensors to be on the same device,
+but found at least two devices, cuda:0 and cuda:1!
+```
+
+**根因**：手动 device_map 把 `embed_tokens` 放在 GPU 0，但 `vit_model`、`connector`、`time_embedder`、`vae2llm`、`llm2vae`、`latent_pos_embed`、`vit_pos_embed` 这些**辅助模块**全部放在 GPU 1。
+
+而在 Bagel 的 `prepare_vae_latent` / `prepare_prompts` 等 forward 方法中，这些模块需要协同工作——比如 `llm2vae` 的输出要和 `latent_pos_embed` 的结果拼接，如果它们在不同的 GPU 上，tensor 拼接就会报跨设备错误。
+
+对比：原来的 accelerate 代码有这一段强制同卡逻辑，但我们手动构建 device_map 时跳过了：
+
+```python
+same_device_modules = [
+    "language_model.model.embed_tokens", "time_embedder", "latent_pos_embed",
+    "vae2llm", "llm2vae", "connector", "vit_pos_embed",
+]
+first_device = device_map.get(same_device_modules[0])
+for k in same_device_modules:
+    device_map[k] = first_device  # 强制同一张卡
+```
+
+**预期修复**（待实施）：把所有 `same_device_modules` 强制放到 GPU 0（embed_tokens 所在的卡），或者全部放到 GPU 1。关键是这些模块必须**同一张卡**。
+
+```python
+# 修复：将所有辅助模块与 embed_tokens 放在同一卡
+device_map["language_model.model.embed_tokens"] = 0
+for k in same_device_modules:
+    device_map[k] = 0  # 全部 GPU 0
+# vit_model 和 lm_head 也放 GPU 0
+device_map["vit_model"] = 0
+device_map["language_model.lm_head"] = 0
+device_map["connector"] = 0
+# 然后调整层分配：GPU 0 放少一些层（比如 12 层），让出空间给 aux 模块
+```
+
+这样 GPU 0 装 embed + aux 模块 + 12 层 LLM，GPU 1 装剩余 16 层 LLM + norm。显存大致均衡。
+
+### 8.10 当前状态
+
+sweep 尚未成功跑通。问题链：
+
+1. ✅ 两 kernel 冲突 → 已解决（关旧 kernel）
+2. ✅ CUDA_VISIBLE_DEVICES 不生效 → 已解决（subprocess.Popen + env）
+3. ✅ 层被 offload 到 disk → 已解决（dtype=bf16）
+4. ✅ 分层不均衡 OOM → 已解决（手动 device_map）
+5. ⚠️ 手动 device_map 跨设备冲突 → **待修复**
+
+文件清单：
+- `experiments/run_cap_sweep_mp.py` — 多卡并行 sweep 脚本
+- `experiments/think_cap_benchmark.ipynb` — cell-8b 调用上述脚本
+- `inferencer.py` — §4 的 VAE decode dtype 修复
