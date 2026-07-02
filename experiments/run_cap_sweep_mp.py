@@ -298,32 +298,41 @@ def run_worker():
 
         # ── 手动均衡 device_map ──
         # infer_auto_device_map 即使加了 dtype=bf16 也会把 24/28 层塞到 GPU 0
-        # (23.4 GiB), 留不下 forward 临时空间。这里手动均衡: 14 层/卡。
+        # (23.4 GiB), 留不下 forward 临时空间。这里手动均衡分层。
+        # GPU 0 让出 1 层 (13/15): 它还要装 same_device_modules + VAE +
+        # latent 准备 (4096 image tokens) 的工作空间。
         num_layers = llm_config.num_hidden_layers  # 28
-        split = num_layers // 2  # 14
+        split = num_layers // 2 - 1  # 13
         device_map = {}
         for layer_idx in range(num_layers):
             gpu = 0 if layer_idx < split else 1
             device_map[f"language_model.model.layers.{layer_idx}"] = gpu
 
-        # Embed / norm / head
-        device_map["language_model.model.embed_tokens"] = 0
+        # same_device_modules (对齐官方 app.py:81-102): 这些模块的裸输出会在
+        # bagel.py 的 prepare_* 方法中直接相加/拼接, 中间没有 accelerate hook
+        # 搬运, 必须与 embed_tokens 同卡, 否则跨设备 RuntimeError。
+        same_device_modules = [
+            "language_model.model.embed_tokens",
+            "time_embedder",
+            "latent_pos_embed",
+            "vae2llm",
+            "llm2vae",
+            "connector",
+            "vit_pos_embed",
+        ]
+        for k in same_device_modules:
+            device_map[k] = 0
+
+        # norm / lm_head / vit_model 不在 same_device 名单里且
+        # tie_word_embeddings=False, hook 能正确搬运其输入 → 留 GPU 1
         device_map["language_model.model.norm"] = 1
         device_map["language_model.model.norm_moe_gen"] = 1
         device_map["language_model.model.rotary_emb"] = 1
         device_map["language_model.lm_head"] = 1
-
-        # Vision / connector modules → GPU 1 (GPU 0 跑 VAE + forward, 留空间)
         device_map["vit_model"] = 1
-        device_map["connector"] = 1
-        device_map["vit_pos_embed"] = 1
-        device_map["time_embedder"] = 1
-        device_map["vae2llm"] = 1
-        device_map["llm2vae"] = 1
-        device_map["latent_pos_embed"] = 1
 
-        print(f"[Worker {worker_id}] device_map: GPU 0 = layers 0-{split-1} + embed, "
-              f"GPU 1 = layers {split}-{num_layers-1} + norm/head/vit/connectors")
+        print(f"[Worker {worker_id}] device_map: GPU 0 = layers 0-{split-1} + embed + aux(same-device), "
+              f"GPU 1 = layers {split}-{num_layers-1} + norm/head/vit")
 
         model = load_checkpoint_and_dispatch(
             model,
