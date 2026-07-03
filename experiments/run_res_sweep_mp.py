@@ -57,6 +57,16 @@ GENEVAL_PROMPTS_PATH = os.path.join(_proj_root, "eval/gen/geneval/prompts/evalua
 WISE_PROMPTS_PATH = os.path.join(_proj_root, "eval/gen/wise/final_data.json")
 
 
+def _apply_overrides(caps: str = None, force_think: bool = False):
+    """补跑用: 覆盖模块级常量。必须在 build_trials() 之前调用, 且 main 与 worker 两侧
+    都要调用同样的覆盖, 否则 worker 重建的 trial 列表与主进程分配的 index 对不上。"""
+    global MAX_THINK_TOKEN_LIST, FORCE_THINK_LENGTH
+    if caps:
+        MAX_THINK_TOKEN_LIST = [int(x) for x in caps.split(",")]
+    if force_think:
+        FORCE_THINK_LENGTH = True
+
+
 def build_conditions():
     """构建 condition 列表 (R × N × cap 完全交叉)"""
     return [
@@ -114,7 +124,16 @@ def main():
                         help="Comma-separated GPU IDs")
     parser.add_argument("--gpus-per-worker", type=int, default=2,
                         help="GPUs per worker (default: 2; model ~28GB doesn't fit on single 24GB GPU)")
+    parser.add_argument("--force-think", action="store_true",
+                        help="开启 budget forcing (min=max=cap), 见 experiments/BUDGET_FORCING.md")
+    parser.add_argument("--caps", type=str, default=None,
+                        help="逗号分隔的 cap 列表, 覆盖 MAX_THINK_TOKEN_LIST (补跑用, 如 1000,256)")
+    parser.add_argument("--output-dir", type=str, default=OUTPUT_DIR,
+                        help="输出目录 (补跑时换一个目录, 避免覆盖已有 trials.csv)")
     args = parser.parse_args()
+
+    _apply_overrides(args.caps, args.force_think)
+    output_dir = args.output_dir
 
     all_gpus = [int(x.strip()) for x in args.gpus.split(",")]
     gpus_per_worker = args.gpus_per_worker
@@ -127,7 +146,7 @@ def main():
     worker_gpus = [all_gpus[i * gpus_per_worker:(i + 1) * gpus_per_worker]
                    for i in range(n_workers)]
 
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    os.makedirs(output_dir, exist_ok=True)
 
     trials, all_conditions = build_trials()
     total_trials = len(trials)
@@ -162,8 +181,12 @@ def main():
             "--worker",
             "--worker-id", str(wid),
             "--trial-indices", trial_indices_json,
-            "--output-dir", OUTPUT_DIR,
+            "--output-dir", output_dir,
         ]
+        if args.force_think:
+            cmd.append("--force-think")
+        if args.caps:
+            cmd += ["--caps", args.caps]
 
         p = subprocess.Popen(cmd, env=env)
         processes.append((wid, p))
@@ -177,7 +200,7 @@ def main():
             print(f"[Main] Worker {wid} DONE")
 
     # ── 合并结果 ──
-    worker_files = [os.path.join(OUTPUT_DIR, f"worker_{i}.csv") for i in range(n_workers)]
+    worker_files = [os.path.join(output_dir, f"worker_{i}.csv") for i in range(n_workers)]
     dfs = []
     for f in worker_files:
         if os.path.exists(f):
@@ -187,7 +210,7 @@ def main():
         merged = pd.concat(dfs, ignore_index=True)
         merged["hardware"] = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "unknown"
         merged["timestamp"] = time.strftime("%Y-%m-%dT%H:%M:%S")
-        out_path = os.path.join(OUTPUT_DIR, "trials.csv")
+        out_path = os.path.join(output_dir, "trials.csv")
         merged.to_csv(out_path, index=False)
         print(f"\nMerged {len(merged)} rows ({merged['ok'].sum()} ok) → {out_path}")
     else:
@@ -202,10 +225,14 @@ def run_worker():
     parser.add_argument("--worker-id", type=int)
     parser.add_argument("--trial-indices", type=str)  # JSON list
     parser.add_argument("--output-dir", type=str)
+    parser.add_argument("--force-think", action="store_true")
+    parser.add_argument("--caps", type=str, default=None)
     args = parser.parse_args()
 
     if not args.worker:
         return False
+
+    _apply_overrides(args.caps, args.force_think)
 
     worker_id = args.worker_id
     trial_indices = json.loads(args.trial_indices)
@@ -466,6 +493,8 @@ def run_worker():
     warmup_prompt = "a photo of a cat"
     base_cond = deepcopy(all_conditions[0])
     base_cond.update(num_timesteps=5, max_think_token_n=32)  # 用最便宜的组合 warm shape
+    if base_cond.get("min_think_token_n", 0) > 32:  # forcing 开启时 min 跟着压到 max
+        base_cond["min_think_token_n"] = 32
     for side in IMAGE_SIDE_LIST:
         wcond = deepcopy(base_cond)
         wcond["image_side"] = side
