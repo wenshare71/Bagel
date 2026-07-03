@@ -1,2 +1,8 @@
 think_bottleneck_outputs/
 think_cap_outputs/
+*_outputs*/*
+!think_res_outputs/fraction_think_heatmap_per_R.png
+!think_res_outputs/ratio_vs_cap_per_R.png
+!think_res_outputs/s_vs_tokens.png
+!think_res_outputs/t_image_vs_N_per_R.png
+!think_res_outputs/aggregated.csv
