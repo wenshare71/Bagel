@@ -49,7 +49,7 @@ MAX_THINK_TOKEN_LIST = [1000, 256, 128, 64, 32]
 # budget forcing(s1 式):True 时 think 到达 cap 前不许自然停止,
 # 模型每次想输出 EOS 都会被换成 WAIT_INTERJECTION 继续生成,
 # 即 min = max = cap,把 think token 数精确钉死在 cap 上
-FORCE_THINK_LENGTH = False
+FORCE_THINK_LENGTH = True
 WAIT_INTERJECTION = " Wait,"
 N_REPEATS = 2
 SWEEP_SHUFFLE_SEED = 42
