@@ -193,11 +193,17 @@ class InterleaveInferencer:
         return image
 
     @torch.no_grad()
-    def gen_text(self, gen_context, max_length: int = 500, do_sample: bool = True, temperature: float = 1.0):
+    def gen_text(self, gen_context, max_length: int = 500, do_sample: bool = True, temperature: float = 1.0,
+                 min_length: int = 0, wait_interjection: str = None):
         gen_context = deepcopy(gen_context)
         past_key_values = gen_context['past_key_values']
         kv_lens = gen_context['kv_lens']
         ropes = gen_context['ropes']
+
+        # budget forcing: replace early EOS with this interjection until min_length is reached
+        wait_token_ids = None
+        if min_length > 0 and wait_interjection:
+            wait_token_ids = self.tokenizer.encode(wait_interjection, add_special_tokens=False)
 
         generation_input = self.model.prepare_start_tokens(kv_lens, ropes, self.new_token_ids)
         unpacked_latent = self.model.generate_text(
@@ -206,6 +212,8 @@ class InterleaveInferencer:
             do_sample=do_sample,
             temperature=temperature,
             end_token_id=self.new_token_ids['eos_token_id'],
+            min_length=min_length,
+            wait_token_ids=wait_token_ids,
             **generation_input,
         )
         output = self.tokenizer.decode(unpacked_latent[:,0])
@@ -220,6 +228,8 @@ class InterleaveInferencer:
         understanding_output=False,
 
         max_think_token_n=1000,
+        min_think_token_n=0,
+        think_wait_interjection=None,
         do_sample=False,
         text_temperature=0.3,
         cfg_text_scale=3.0,
@@ -264,12 +274,14 @@ class InterleaveInferencer:
                     raise ValueError(f"Unsupported input type: {type(input_term)}")
 
             if understanding_output:
-                gen_text = self.gen_text(gen_context, do_sample=do_sample, temperature=text_temperature, max_length=max_think_token_n)
+                gen_text = self.gen_text(gen_context, do_sample=do_sample, temperature=text_temperature, max_length=max_think_token_n,
+                                         min_length=min_think_token_n, wait_interjection=think_wait_interjection)
                 output_list.append(gen_text)
 
             else:
                 if think:
-                    gen_text = self.gen_text(gen_context, do_sample=do_sample, temperature=text_temperature, max_length=max_think_token_n)
+                    gen_text = self.gen_text(gen_context, do_sample=do_sample, temperature=text_temperature, max_length=max_think_token_n,
+                                             min_length=min_think_token_n, wait_interjection=think_wait_interjection)
                     gen_context = self.update_context_text(gen_text, gen_context)
                     output_list.append(gen_text)
 

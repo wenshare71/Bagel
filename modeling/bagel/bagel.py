@@ -938,10 +938,16 @@ class Bagel(PreTrainedModel):
         do_sample: bool = False,
         temperature: float = 1.0,
         end_token_id: int = None,
+        min_length: int = 0,
+        wait_token_ids: List[int] = None,
     ):
         step = 0
         generated_sequence = []
         curr_tokens = packed_start_tokens
+        # budget forcing (s1-style): tokens queued here override the model's
+        # own prediction, so a multi-token interjection like "Wait," is fed
+        # through the loop one token per step
+        forced_queue = []
         while step < max_length:
             generated_sequence.append(curr_tokens)
             packed_text_embedding = self.language_model.model.embed_tokens(curr_tokens)
@@ -982,6 +988,15 @@ class Bagel(PreTrainedModel):
                 curr_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
             else:
                 curr_tokens = torch.argmax(pred_logits, dim=-1)
+
+            if wait_token_ids:
+                if forced_queue:
+                    curr_tokens = torch.full_like(curr_tokens, forced_queue.pop(0))
+                elif end_token_id is not None and curr_tokens[0] == end_token_id and step < min_length:
+                    # model tried to stop early: swap EOS for a continuation
+                    # cue so it keeps thinking until min_length
+                    forced_queue.extend(wait_token_ids)
+                    curr_tokens = torch.full_like(curr_tokens, forced_queue.pop(0))
 
             uppacked = list(packed_key_value_indexes.split(key_values_lens.tolist(), dim=0))
             for i in range(len(uppacked)):

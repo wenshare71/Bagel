@@ -46,6 +46,11 @@ OUTPUT_DIR = os.path.join(_proj_root, "experiments", "think_cap_outputs")
 
 NUM_TIMESTEPS_LIST = [50, 10, 5]
 MAX_THINK_TOKEN_LIST = [1000, 256, 128, 64, 32]
+# budget forcing(s1 式):True 时 think 到达 cap 前不许自然停止,
+# 模型每次想输出 EOS 都会被换成 WAIT_INTERJECTION 继续生成,
+# 即 min = max = cap,把 think token 数精确钉死在 cap 上
+FORCE_THINK_LENGTH = False
+WAIT_INTERJECTION = " Wait,"
 N_REPEATS = 2
 SWEEP_SHUFFLE_SEED = 42
 SEED_BASE = 1000
@@ -61,6 +66,8 @@ def build_conditions():
     return [
         dict(
             num_timesteps=n, max_think_token_n=cap,
+            min_think_token_n=cap if FORCE_THINK_LENGTH else 0,
+            wait_interjection=WAIT_INTERJECTION if FORCE_THINK_LENGTH else None,
             cfg_text_scale=1.0, cfg_img_scale=1.0,
             cfg_interval=[0.4, 1.0], cfg_renorm_min=0.0, cfg_renorm_type="global",
             timestep_shift=3.0, enable_taylorseer=False,
@@ -413,6 +420,8 @@ def run_worker():
                     gen_text = inferencer.gen_text(
                         gen_context, do_sample=False, temperature=0.3,
                         max_length=cond["max_think_token_n"],
+                        min_length=cond.get("min_think_token_n", 0),
+                        wait_interjection=cond.get("wait_interjection"),
                     )
 
                 gen_context = inferencer.update_context_text(gen_text, gen_context)
