@@ -17,7 +17,7 @@ think-vs-image 延迟 benchmark（详见 `EXPERIMENT_SUMMARY.md` 全链路总结
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence
 
-This project is indexed by GitNexus as **Bagel** (4442 symbols, 6277 relationships, 107 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+This project is indexed by GitNexus as **Bagel** (4486 symbols, 6319 relationships, 107 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
 
 > If any GitNexus tool warns the index is stale, run `npx gitnexus analyze` in terminal first.
 

@@ -11,3 +11,7 @@ gradio.sh
 data_example
 
 .venv*
+
+# GitNexus generated files
+AGENTS.md
+.claude/
