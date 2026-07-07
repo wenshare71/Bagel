@@ -2,6 +2,8 @@ wandb
 __pycache__
 .vscode
 notebooks
+# 上游规则 "notebooks" 会误伤本仓库的实验 notebook 目录, 豁免之
+!experiments/notebooks/
 results
 *.ipynb_checkpoints
 eval_results
