@@ -1,6 +1,6 @@
 # Think-Bottleneck Benchmark Notebook 调试记录
 
-> 实验脚本: `experiments/think_bottleneck_benchmark.ipynb`(cherry-pick 自 wenshare71/Bagel commit `2220398`)
+> 实验脚本: `experiments/notebooks/think_bottleneck_benchmark.ipynb`(cherry-pick 自 wenshare71/Bagel commit `2220398`)
 > 日期: 2026-07-01
 
 ## 1. 环境
@@ -98,7 +98,7 @@ def decode_image(self, latent, image_shape):
 - `torch.autocast(enabled=False)` 屏蔽外层 autocast 对 VAE conv 权重的降精度。
 - 对 `run_inference.py` / `inference.ipynb`(无 autocast)是 no-op,完全兼容。
 
-### 4.2 `experiments/think_bottleneck_benchmark.ipynb` — cell-10 `run_trial`
+### 4.2 `experiments/notebooks/think_bottleneck_benchmark.ipynb` — cell-10 `run_trial`
 
 保留 autocast 包住 **LLM 推理**(gen_text + gen_image 的去噪循环,需要 fp32→bf16 自动转换);VAE decode 在 `gen_image` 内部由 `decode_image` 自己禁用 autocast 处理,无需 notebook 侧干预。
 
@@ -121,7 +121,7 @@ try:
     ...
 ```
 
-### 4.3 `experiments/think_bottleneck_benchmark.ipynb` — cell-14 warm-up
+### 4.3 `experiments/notebooks/think_bottleneck_benchmark.ipynb` — cell-14 warm-up
 
 失败时打印真实 `_["error"]`,不再掩盖:
 
@@ -154,8 +154,8 @@ warm-up (N=50, CFG on) FAILED: RuntimeError('Input type (float) and bias type (c
 ## 6. 本次提交涉及的文件
 
 - `inferencer.py` — `decode_image` dtype/autocast 修复
-- `experiments/think_bottleneck_benchmark.ipynb` — cell-10 (run_trial autocast 范围)、cell-14 (warm-up 错误暴露)
-- `DEBUG_NOTES.md` — 本文档
+- `experiments/notebooks/think_bottleneck_benchmark.ipynb` — cell-10 (run_trial autocast 范围)、cell-14 (warm-up 错误暴露)
+- `docs/DEBUG_NOTES.md` — 本文档
 
 未跟踪文件(`BAGEL-7B-MoT/` 模型权重、`output_*.png`、`run_inference.py`、`requirements_infer.txt`)不纳入本次提交。`.gitignore` 与 `inference.ipynb` 的既有改动也不属于本次诊断范围,不在本次提交内。
 
@@ -392,6 +392,6 @@ sweep 尚未成功跑通。问题链：
 5. ⚠️ 手动 device_map 跨设备冲突 → **待修复**
 
 文件清单：
-- `experiments/run_cap_sweep_mp.py` — 多卡并行 sweep 脚本
-- `experiments/think_cap_benchmark.ipynb` — cell-8b 调用上述脚本
+- `experiments/scripts/run_cap_sweep_mp.py` — 多卡并行 sweep 脚本
+- `experiments/notebooks/think_cap_benchmark.ipynb` — cell-8b 调用上述脚本
 - `inferencer.py` — §4 的 VAE decode dtype 修复

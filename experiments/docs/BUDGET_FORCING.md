@@ -12,7 +12,7 @@ BAGEL think 模式的自然输出长度只有 ~160 token(见 `think_cap_outputs/
 |------|------|
 | `modeling/bagel/bagel.py` | `generate_text` 新增 `min_length`、`wait_token_ids` 参数;token 选择后检测 EOS,`step < min_length` 时用 `forced_queue` 把多 token 插入语逐个注入(注入期间覆盖模型自身预测) |
 | `inferencer.py` | `gen_text` 新增 `min_length`、`wait_interjection`(字符串,内部 tokenize 后下传);`interleave_inference` 新增 `min_think_token_n`、`think_wait_interjection` 透传 |
-| `experiments/run_cap_sweep_mp.py` | 顶部新增 `FORCE_THINK_LENGTH` / `WAIT_INTERJECTION` 开关;开启后每个 condition 的 `min_think_token_n = max_think_token_n`(min = max = cap,think 长度精确钉死在 cap);两个字段随 `**cond` 写入 trials.csv |
+| `experiments/scripts/run_cap_sweep_mp.py` | 顶部新增 `FORCE_THINK_LENGTH` / `WAIT_INTERJECTION` 开关;开启后每个 condition 的 `min_think_token_n = max_think_token_n`(min = max = cap,think 长度精确钉死在 cap);两个字段随 `**cond` 写入 trials.csv |
 
 所有新参数都有默认值(`min_length=0` / `wait_interjection=None`),不开启时行为与原版逐 token 一致。
 
@@ -20,10 +20,10 @@ BAGEL think 模式的自然输出长度只有 ~160 token(见 `think_cap_outputs/
 
 ```bash
 # 1. 打开开关
-#    experiments/run_cap_sweep_mp.py: FORCE_THINK_LENGTH = True
+#    experiments/scripts/run_cap_sweep_mp.py: FORCE_THINK_LENGTH = True
 
 # 2. 正常启动并行 sweep
-python experiments/run_cap_sweep_mp.py --gpus 0,1,2,3,4,5,6,7
+python experiments/scripts/run_cap_sweep_mp.py --gpus 0,1,2,3,4,5,6,7
 ```
 
 单独调用(不走 sweep 脚本):

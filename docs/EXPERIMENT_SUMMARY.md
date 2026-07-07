@@ -18,7 +18,7 @@
 
 ### 阶段 2 — 多卡并行改造:3 小时 → 50 分钟
 
-单卡跑一轮 sweep 要 3 小时,不可持续。改造成多 worker 并行(`run_cap_sweep_mp.py`),过程中连续踩了 5 个坑(完整记录见 `DEBUG_NOTES.md` §8):
+单卡跑一轮 sweep 要 3 小时,不可持续。改造成多 worker 并行(`run_cap_sweep_mp.py`),过程中连续踩了 5 个坑(完整记录见 `docs/DEBUG_NOTES.md` §8):
 
 | # | 问题 | 根因 | 修复 |
 |---|---|---|---|
@@ -57,7 +57,7 @@
 | 多卡并行 sweep 脚本 | `run_cap_sweep_mp.py`(think cap × N)、`run_res_sweep_mp.py`(+ R,支持 `--force-think`/`--caps`/`--output-dir`) |
 | 分析 notebook | `think_bottleneck_benchmark.ipynb`(单卡探索)、`think_cap_benchmark.ipynb`、`resolution_sweep_benchmark.ipynb`(含 §3b 强制批次合并) |
 | 原始数据 | `think_res_outputs/`(aggregated.csv + 4 张图),`think_res_outputs_forced/trials.csv` |
-| 工程记录 | `DEBUG_NOTES.md`(dtype bug、OOM、多卡 5 连坑完整排查过程) |
+| 工程记录 | `docs/DEBUG_NOTES.md`(dtype bug、OOM、多卡 5 连坑完整排查过程) |
 | 方案文档 | `BUDGET_FORCING.md`(budget forcing 设计与改动点) |
 | 结论文档 | `PROFILE_ANALYSIS.md` |
 

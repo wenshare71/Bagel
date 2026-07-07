@@ -1,19 +1,18 @@
 #!/usr/bin/env python3
 """
-think_cap_benchmark 多卡并行 sweep 脚本
+resolution_sweep_benchmark 多卡并行 sweep 脚本(最终实验)
+
+在 think_cap 实验(cap × N)基础上加入第三维:图像分辨率 R。
+网格: R ∈ {1024, 768, 512, 256} × N ∈ {50, 10, 5} × cap ∈ {1000, 256, 128, 64, 32}
+图像 token 数 = (R / 16)^2 → 4096 / 2304 / 1024 / 256(上限 R=1024, max_latent_size=64)
 
 用法:
-  # 4 进程并行, 每进程用 2 张 GPU
-  python experiments/run_cap_sweep_mp.py
+  python experiments/scripts/run_res_sweep_mp.py --gpus 0,1,2,3,4,5,6,7
 
-  # 自定义 GPU 分配
-  python experiments/run_cap_sweep_mp.py --gpus 0,1,2,3,4,5,6,7
-
-设计:
+设计(与 run_cap_sweep_mp.py 一致):
   - 每个 worker 进程拥有独立的模型实例 (2 GPUs via accelerate device_map)
-  - trials 均匀分配
-  - 结果写入 experiments/think_cap_outputs/worker_*.csv
-  - 自动合并
+  - trials 均匀分配, 结果写入 experiments/think_res_outputs/worker_*.csv, 自动合并
+  - warm-up 按分辨率各做一次 (attention/cudnn kernel 按 shape 缓存)
 """
 
 import os
@@ -23,7 +22,6 @@ import time
 import random
 import gc
 import argparse
-import multiprocessing as mp
 import subprocess
 from copy import deepcopy
 from contextlib import contextmanager
@@ -31,7 +29,7 @@ from contextlib import contextmanager
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 # ── 路径 ──
-_proj_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+_proj_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if _proj_root not in sys.path:
     sys.path.insert(0, _proj_root)
 
@@ -41,15 +39,13 @@ import pandas as pd
 
 # ── 常量 ──
 MODEL_PATH = os.path.join(_proj_root, "BAGEL-7B-MoT")
-IMAGE_SHAPE = (1024, 1024)
-OUTPUT_DIR = os.path.join(_proj_root, "experiments", "think_cap_outputs")
+OUTPUT_DIR = os.path.join(_proj_root, "experiments", "outputs", "think_res_outputs")
 
+LATENT_DOWNSAMPLE = 16  # VAE 8x × latent_patch 2x → token 数 = (side/16)^2
+IMAGE_SIDE_LIST = [1024, 768, 512, 256]  # 边长必须是 16 的倍数且 ≤1024 (max_latent_size=64)
 NUM_TIMESTEPS_LIST = [50, 10, 5]
 MAX_THINK_TOKEN_LIST = [1000, 256, 128, 64, 32]
-# budget forcing(s1 式):True 时 think 到达 cap 前不许自然停止,
-# 模型每次想输出 EOS 都会被换成 WAIT_INTERJECTION 继续生成,
-# 即 min = max = cap,把 think token 数精确钉死在 cap 上
-FORCE_THINK_LENGTH = True
+FORCE_THINK_LENGTH = False  # budget forcing 开关, 见 experiments/BUDGET_FORCING.md
 WAIT_INTERJECTION = " Wait,"
 N_REPEATS = 2
 SWEEP_SHUFFLE_SEED = 42
@@ -61,10 +57,21 @@ GENEVAL_PROMPTS_PATH = os.path.join(_proj_root, "eval/gen/geneval/prompts/evalua
 WISE_PROMPTS_PATH = os.path.join(_proj_root, "eval/gen/wise/final_data.json")
 
 
+def _apply_overrides(caps: str = None, force_think: bool = False):
+    """补跑用: 覆盖模块级常量。必须在 build_trials() 之前调用, 且 main 与 worker 两侧
+    都要调用同样的覆盖, 否则 worker 重建的 trial 列表与主进程分配的 index 对不上。"""
+    global MAX_THINK_TOKEN_LIST, FORCE_THINK_LENGTH
+    if caps:
+        MAX_THINK_TOKEN_LIST = [int(x) for x in caps.split(",")]
+    if force_think:
+        FORCE_THINK_LENGTH = True
+
+
 def build_conditions():
-    """构建 condition 列表"""
+    """构建 condition 列表 (R × N × cap 完全交叉)"""
     return [
         dict(
+            image_side=side,
             num_timesteps=n, max_think_token_n=cap,
             min_think_token_n=cap if FORCE_THINK_LENGTH else 0,
             wait_interjection=WAIT_INTERJECTION if FORCE_THINK_LENGTH else None,
@@ -72,13 +79,14 @@ def build_conditions():
             cfg_interval=[0.4, 1.0], cfg_renorm_min=0.0, cfg_renorm_type="global",
             timestep_shift=3.0, enable_taylorseer=False,
         )
+        for side in IMAGE_SIDE_LIST
         for n in NUM_TIMESTEPS_LIST
         for cap in MAX_THINK_TOKEN_LIST
     ]
 
 
 def build_trials():
-    """构建 trial 列表"""
+    """构建 trial 列表(prompt 采样与 think_cap 实验完全一致, 保证可比)"""
     with open(GENEVAL_PROMPTS_PATH, "r", encoding="utf-8") as f:
         geneval_all = [json.loads(line)["prompt"] for line in f]
     with open(WISE_PROMPTS_PATH, "r", encoding="utf-8") as f:
@@ -111,12 +119,21 @@ def build_trials():
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Multi-GPU parallel sweep for think_cap_benchmark")
+    parser = argparse.ArgumentParser(description="Multi-GPU parallel sweep for resolution_sweep_benchmark")
     parser.add_argument("--gpus", type=str, default="0,1,2,3,4,5,6,7",
                         help="Comma-separated GPU IDs")
     parser.add_argument("--gpus-per-worker", type=int, default=2,
                         help="GPUs per worker (default: 2; model ~28GB doesn't fit on single 24GB GPU)")
+    parser.add_argument("--force-think", action="store_true",
+                        help="开启 budget forcing (min=max=cap), 见 experiments/BUDGET_FORCING.md")
+    parser.add_argument("--caps", type=str, default=None,
+                        help="逗号分隔的 cap 列表, 覆盖 MAX_THINK_TOKEN_LIST (补跑用, 如 1000,256)")
+    parser.add_argument("--output-dir", type=str, default=OUTPUT_DIR,
+                        help="输出目录 (补跑时换一个目录, 避免覆盖已有 trials.csv)")
     args = parser.parse_args()
+
+    _apply_overrides(args.caps, args.force_think)
+    output_dir = args.output_dir
 
     all_gpus = [int(x.strip()) for x in args.gpus.split(",")]
     gpus_per_worker = args.gpus_per_worker
@@ -129,17 +146,18 @@ def main():
     worker_gpus = [all_gpus[i * gpus_per_worker:(i + 1) * gpus_per_worker]
                    for i in range(n_workers)]
 
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    os.makedirs(output_dir, exist_ok=True)
 
-    # 构建 trials
     trials, all_conditions = build_trials()
     total_trials = len(trials)
-    print(f"Total trials: {total_trials}")
+    print(f"Total trials: {total_trials} "
+          f"({len(IMAGE_SIDE_LIST)}R × {len(NUM_TIMESTEPS_LIST)}N × {len(MAX_THINK_TOKEN_LIST)}cap "
+          f"× {2 * N_PROMPTS_PER_SOURCE} prompts × {N_REPEATS} repeats)")
     print(f"Workers: {n_workers} (each using {gpus_per_worker} GPU(s))")
     for wid, gpus in enumerate(worker_gpus):
         print(f"  Worker {wid}: GPU(s) {gpus}")
     print(f"Trials per worker: ~{total_trials // n_workers}")
-    print(f"Estimated time: ~{2.5 / n_workers:.1f}h\n")
+    print(f"Estimated time: ~{8.0 / n_workers:.1f}h\n")
 
     # 交错分配 trials
     trial_indices_per_worker = [[] for _ in range(n_workers)]
@@ -163,14 +181,17 @@ def main():
             "--worker",
             "--worker-id", str(wid),
             "--trial-indices", trial_indices_json,
-            "--output-dir", OUTPUT_DIR,
+            "--output-dir", output_dir,
         ]
+        if args.force_think:
+            cmd.append("--force-think")
+        if args.caps:
+            cmd += ["--caps", args.caps]
 
         p = subprocess.Popen(cmd, env=env)
         processes.append((wid, p))
         print(f"[Main] Spawned worker {wid} (PID {p.pid}) on GPU(s) {gpu_str}")
 
-    # 等待所有 worker
     for wid, p in processes:
         p.wait()
         if p.returncode != 0:
@@ -179,7 +200,7 @@ def main():
             print(f"[Main] Worker {wid} DONE")
 
     # ── 合并结果 ──
-    worker_files = [os.path.join(OUTPUT_DIR, f"worker_{i}.csv") for i in range(n_workers)]
+    worker_files = [os.path.join(output_dir, f"worker_{i}.csv") for i in range(n_workers)]
     dfs = []
     for f in worker_files:
         if os.path.exists(f):
@@ -189,7 +210,7 @@ def main():
         merged = pd.concat(dfs, ignore_index=True)
         merged["hardware"] = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "unknown"
         merged["timestamp"] = time.strftime("%Y-%m-%dT%H:%M:%S")
-        out_path = os.path.join(OUTPUT_DIR, "trials.csv")
+        out_path = os.path.join(output_dir, "trials.csv")
         merged.to_csv(out_path, index=False)
         print(f"\nMerged {len(merged)} rows ({merged['ok'].sum()} ok) → {out_path}")
     else:
@@ -204,13 +225,15 @@ def run_worker():
     parser.add_argument("--worker-id", type=int)
     parser.add_argument("--trial-indices", type=str)  # JSON list
     parser.add_argument("--output-dir", type=str)
+    parser.add_argument("--force-think", action="store_true")
+    parser.add_argument("--caps", type=str, default=None)
     args = parser.parse_args()
 
     if not args.worker:
         return False
 
-    # CUDA_VISIBLE_DEVICES already set via subprocess env → effective before torch import
-    # torch imported at module level, but subprocess inherits env → torch init respects it
+    _apply_overrides(args.caps, args.force_think)
+
     worker_id = args.worker_id
     trial_indices = json.loads(args.trial_indices)
     output_dir = args.output_dir
@@ -233,7 +256,6 @@ def run_worker():
 
     # ── 加载模型 ──
     if gpu_count == 1:
-        # 单卡模式: 尝试加载 (可能 OOM)
         llm_config = Qwen2Config.from_json_file(os.path.join(MODEL_PATH, "llm_config.json"))
         llm_config.qk_norm = True
         llm_config.tie_word_embeddings = False
@@ -271,7 +293,7 @@ def run_worker():
         vae_model = vae_model.to(device="cuda:0").eval()
     else:
         # 多卡 accelerate 模式 (2 GPUs per worker)
-        from accelerate import infer_auto_device_map, load_checkpoint_and_dispatch, init_empty_weights
+        from accelerate import load_checkpoint_and_dispatch, init_empty_weights
 
         print(f"[Worker {worker_id}] Loading with accelerate device_map ({gpu_count} GPUs)...")
 
@@ -303,11 +325,7 @@ def run_worker():
         tokenizer = Qwen2Tokenizer.from_pretrained(MODEL_PATH)
         tokenizer, new_token_ids, _ = add_special_tokens(tokenizer)
 
-        # ── 手动均衡 device_map ──
-        # infer_auto_device_map 即使加了 dtype=bf16 也会把 24/28 层塞到 GPU 0
-        # (23.4 GiB), 留不下 forward 临时空间。这里手动均衡分层。
-        # GPU 0 让出 1 层 (13/15): 它还要装 same_device_modules + VAE +
-        # latent 准备 (4096 image tokens) 的工作空间。
+        # ── 手动均衡 device_map (与 run_cap_sweep_mp.py 相同, 已验证 480/480 OK) ──
         num_layers = llm_config.num_hidden_layers  # 28
         split = num_layers // 2 - 1  # 13
         device_map = {}
@@ -316,8 +334,7 @@ def run_worker():
             device_map[f"language_model.model.layers.{layer_idx}"] = gpu
 
         # same_device_modules (对齐官方 app.py:81-102): 这些模块的裸输出会在
-        # bagel.py 的 prepare_* 方法中直接相加/拼接, 中间没有 accelerate hook
-        # 搬运, 必须与 embed_tokens 同卡, 否则跨设备 RuntimeError。
+        # bagel.py 的 prepare_* 方法中直接相加/拼接, 必须与 embed_tokens 同卡
         same_device_modules = [
             "language_model.model.embed_tokens",
             "time_embedder",
@@ -330,8 +347,6 @@ def run_worker():
         for k in same_device_modules:
             device_map[k] = 0
 
-        # norm / lm_head / vit_model 不在 same_device 名单里且
-        # tie_word_embeddings=False, hook 能正确搬运其输入 → 留 GPU 1
         device_map["language_model.model.norm"] = 1
         device_map["language_model.model.norm_moe_gen"] = 1
         device_map["language_model.model.rotary_emb"] = 1
@@ -402,6 +417,7 @@ def run_worker():
         set_all_seeds(seed)
 
         record = dict(prompt=prompt, seed=seed, **cond)
+        record["image_token_count"] = (cond["image_side"] // LATENT_DOWNSAMPLE) ** 2
         gen_context = cfg_text_context = cfg_img_context = None
         try:
             gen_context = inferencer.init_gen_context()
@@ -428,7 +444,7 @@ def run_worker():
 
                 with sync_timer() as t_image:
                     inferencer.gen_image(
-                        IMAGE_SHAPE, gen_context,
+                        (cond["image_side"], cond["image_side"]), gen_context,
                         cfg_text_precontext=cfg_text_context,
                         cfg_img_precontext=cfg_img_context,
                         cfg_text_scale=cond["cfg_text_scale"],
@@ -472,17 +488,25 @@ def run_worker():
     # ── 重建 trials (种子固定, 结果与主进程一致) ──
     all_trials, all_conditions = build_trials()
 
-    # ── Warm-up ──
-    warmup_cond = all_conditions[0]
-    warmup_prompt = "a photo of a cat"  # 简单 prompt 用于 kernel 编译
-    print(f"[Worker {worker_id}] Warm-up...")
-    _ = run_trial(warmup_prompt, warmup_cond, seed=999)
-    if not _["ok"]:
-        print(f"[Worker {worker_id}] WARM-UP FAILED: {_['error']}")
-        pd.DataFrame([{"worker": worker_id, "ok": False, "error": f"warmup: {_['error']}"}]
-                     ).to_csv(os.path.join(output_dir, f"worker_{worker_id}.csv"), index=False)
-        return
-    print(f"[Worker {worker_id}] Warm-up OK: t_think={_['t_think']:.2f}s t_image={_['t_image']:.2f}s")
+    # ── Warm-up: 每个分辨率各一次 (attention/cudnn kernel 按 shape 缓存, 只 warm 一档
+    #    会让其余分辨率的首个 trial 计时偏慢) ──
+    warmup_prompt = "a photo of a cat"
+    base_cond = deepcopy(all_conditions[0])
+    base_cond.update(num_timesteps=5, max_think_token_n=32)  # 用最便宜的组合 warm shape
+    if base_cond.get("min_think_token_n", 0) > 32:  # forcing 开启时 min 跟着压到 max
+        base_cond["min_think_token_n"] = 32
+    for side in IMAGE_SIDE_LIST:
+        wcond = deepcopy(base_cond)
+        wcond["image_side"] = side
+        print(f"[Worker {worker_id}] Warm-up @ {side}x{side}...")
+        _ = run_trial(warmup_prompt, wcond, seed=999)
+        if not _["ok"]:
+            print(f"[Worker {worker_id}] WARM-UP FAILED @ {side}: {_['error']}")
+            pd.DataFrame([{"worker": worker_id, "ok": False, "error": f"warmup@{side}: {_['error']}"}]
+                         ).to_csv(os.path.join(output_dir, f"worker_{worker_id}.csv"), index=False)
+            return
+        print(f"[Worker {worker_id}] Warm-up @ {side} OK: "
+              f"t_think={_['t_think']:.2f}s t_image={_['t_image']:.2f}s")
 
     # ── Sweep ──
     rows = []
@@ -520,7 +544,6 @@ def run_worker():
 
 
 if __name__ == "__main__":
-    # 检测是否是 --worker 模式
     if "--worker" in sys.argv:
         run_worker()
     else:

@@ -4,13 +4,13 @@
 
 用法:
   # ⚠ 必须在 import torch 之前设置 CUDA_VISIBLE_DEVICES=0,1 (单进程双卡)
-  CUDA_VISIBLE_DEVICES=0,1 python experiments/run_asym_bench.py --placement asym
-  CUDA_VISIBLE_DEVICES=0,1 python experiments/run_asym_bench.py --placement pipeline
+  CUDA_VISIBLE_DEVICES=0,1 python experiments/scripts/run_asym_bench.py --placement asym
+  CUDA_VISIBLE_DEVICES=0,1 python experiments/scripts/run_asym_bench.py --placement pipeline
 
 设计:
   - 单进程, 双卡
   - --placement {asym,pipeline}:
-      asym    → experiments.asym_placement.load_model_asym
+      asym    → experiments.scripts.asym_placement.load_model_asym
       pipeline→ 复用 run_cap_sweep_mp.py:272-356 的 13/15 accelerate 加载 (对照组)
   - 复用 run_cap_sweep_mp.py:388-457 的 sync_timer / trial 结构
   - warm-up 1 次 (默认开启, --no-warmup 关闭)
@@ -31,7 +31,7 @@ from copy import deepcopy
 
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-_proj_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+_proj_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if _proj_root not in sys.path:
     sys.path.insert(0, _proj_root)
 
@@ -42,7 +42,7 @@ import pandas as pd
 # ── 常量 ──
 MODEL_PATH = os.path.join(_proj_root, "BAGEL-7B-MoT")
 IMAGE_SHAPE = (1024, 1024)
-OUTPUT_DIR = os.path.join(_proj_root, "experiments", "asym_bench_outputs")
+OUTPUT_DIR = os.path.join(_proj_root, "experiments", "outputs", "asym_bench_outputs")
 
 DEFAULT_CAPS = [256, 1000]
 DEFAULT_NUM_TIMESTEPS = [50, 10]
@@ -301,7 +301,7 @@ def main():
 
     # ── 加载模型 ──
     if args.placement == "asym":
-        from experiments.asym_placement import (
+        from experiments.scripts.asym_placement import (
             load_model_asym, verify_placement, install_input_transfer_shim,
         )
         model, vae_model, tokenizer, new_token_ids = load_model_asym(

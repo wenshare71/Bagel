@@ -160,4 +160,4 @@ ratio = t_think / t_image ≈ 0.055·T / (s(R)·N)
 
 ---
 
-*数据与图表:`experiments/think_res_outputs/`(aggregated.csv + 4 PNG);实验脚本 `run_res_sweep_mp.py`,分析 notebook `resolution_sweep_benchmark.ipynb`;budget forcing 实现见 `BUDGET_FORCING.md`。*
+*数据与图表:`experiments/outputs/think_res_outputs/`(aggregated.csv + 4 PNG);实验脚本 `run_res_sweep_mp.py`,分析 notebook `resolution_sweep_benchmark.ipynb`;budget forcing 实现见 `BUDGET_FORCING.md`。*

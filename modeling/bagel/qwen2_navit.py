@@ -518,7 +518,7 @@ class PackedAttentionMoT(Qwen2Attention):
             packed_query_states = self.q_norm(packed_query_states)
             packed_key_states = self.k_norm(packed_key_states)
         elif mode == 'gen':
-            # ── asym placement patch (see speedup/starry-purring-moonbeam.md):
+            # ── asym placement patch (see docs/speedup/starry-purring-moonbeam.md):
             # gen weights may live on gen_dev (cuda:1) while the main hidden states
             # stay on main_dev (cuda:0). Move VAE slice to gen_dev once, run all
             # gen-mode ops there, move results back to main_dev for scatter. `.to()`
