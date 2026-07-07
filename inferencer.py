@@ -60,7 +60,7 @@ class InterleaveInferencer:
 
     @torch.no_grad()
     def update_context_image(self, image, gen_context, vae=True, vit=True):
-        # used for interleave data, currently only support 1 data inference, 
+        # used for interleave data, currently only support 1 data inference
 
         assert vae or vit
         past_key_values = gen_context['past_key_values']
@@ -71,21 +71,36 @@ class InterleaveInferencer:
             ## update vae
             generation_input, kv_lens, ropes = self.model.prepare_vae_images(
                 curr_kvlens=kv_lens,
-                curr_rope=ropes, 
+                curr_rope=ropes,
                 images=[image],
-                transforms=self.vae_transform, 
+                transforms=self.vae_transform,
                 new_token_ids=self.new_token_ids,
             )
+            # Align padded_images to vae_model's real param dtype/device;
+            # torchvision transforms produce fp32 CPU tensors, while the
+            # loaded vae_model may live on a different device / dtype.
+            # Mirror the dtype-alignment pattern from decode_image (d7aa26a).
+            _vae_p = next(self.vae_model.parameters())
+            generation_input["padded_images"] = generation_input["padded_images"].to(
+                device=_vae_p.device, dtype=_vae_p.dtype,
+            )
             past_key_values = self.model.forward_cache_update_vae(self.vae_model, past_key_values, **generation_input)
-        
+
         if vit:
             ## update vit
             generation_input, kv_lens, ropes = self.model.prepare_vit_images(
                 curr_kvlens=kv_lens,
-                curr_rope=ropes, 
+                curr_rope=ropes,
                 images=[image],
-                transforms=self.vit_transform, 
+                transforms=self.vit_transform,
                 new_token_ids=self.new_token_ids,
+            )
+            # Same rationale as vae above: vit_model is loaded as bf16 (pipeline
+            # loader dtype=torch.bfloat16), but packed_vit_tokens is fp32 CPU.
+            # Cast before forward so vit's conv weight dtype matches input.
+            _vit_p = next(self.model.vit_model.parameters())
+            generation_input["packed_vit_tokens"] = generation_input["packed_vit_tokens"].to(
+                device=_vit_p.device, dtype=_vit_p.dtype,
             )
             past_key_values = self.model.forward_cache_update_vit(past_key_values, **generation_input)
 
