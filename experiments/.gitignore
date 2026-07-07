@@ -6,3 +6,4 @@ think_cap_outputs/
 !think_res_outputs/s_vs_tokens.png
 !think_res_outputs/t_image_vs_N_per_R.png
 !think_res_outputs/aggregated.csv
+!asym_bench_outputs/asym_notebook_trials.csv

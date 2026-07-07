@@ -301,12 +301,18 @@ def main():
 
     # ── 加载模型 ──
     if args.placement == "asym":
-        from experiments.asym_placement import load_model_asym, verify_placement
+        from experiments.asym_placement import (
+            load_model_asym, verify_placement, install_input_transfer_shim,
+        )
         model, vae_model, tokenizer, new_token_ids = load_model_asym(
             model_path=args.model_path, und_device="cuda:0", gen_device="cuda:1",
         )
         verify_placement(model, und_device="cuda:0", gen_device="cuda:1",
                          vae_model=vae_model, strict=True)
+        # P0 fix: prepare_* 返回 CPU tensor, asym 模式无 accelerate hook,
+        # 必须显式搬到 cuda:0. 详见 asym_placement.install_input_transfer_shim.
+        n = install_input_transfer_shim(model, und_device="cuda:0")
+        assert n == 6, f"expected to shim 6 prepare_* methods, got {n}"
     else:
         model, vae_model, tokenizer, new_token_ids = _load_model_pipeline(args.model_path)
 

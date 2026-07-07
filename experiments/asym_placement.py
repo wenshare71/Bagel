@@ -260,6 +260,74 @@ def verify_placement(
     )
 
 
+# ── P0 修复: 输入张量搬运 shim ──
+# bagel.py 的所有 prepare_* 方法返回的 generation_input 全是 CPU 张量
+# (torch.tensor / torch.randn 默认 CPU). pipeline 模式靠
+# load_checkpoint_and_dispatch(force_hooks=True) 给子模块挂 forward pre-hook
+# 自动把输入搬到权重所在卡; asym 模式刻意不用 accelerate, 必须显式补这层搬运。
+# 调用方: 加载 asym 模型后立刻 install_input_transfer_shim(model, "cuda:0"),
+# 之后任何 model.prepare_*(...) 返回的 dict 中所有 tensor 都会被 .to(und_device)
+# (同设备 .to() 是 no-op, 所以也兼容单卡 / pipeline 的 future use).
+
+_PREPARE_METHODS = (
+    "prepare_prompts",
+    "prepare_start_tokens",
+    "prepare_vae_latent",
+    "prepare_vae_latent_cfg",
+    "prepare_vae_images",
+    "prepare_vit_images",
+)
+
+
+def _move_tensors_to(obj, device):
+    """递归把 dict / list / tuple 里的所有 torch.Tensor 搬到 device。非 tensor 元素原样穿透。"""
+    if isinstance(obj, torch.Tensor):
+        return obj.to(device) if obj.device != device else obj
+    if isinstance(obj, dict):
+        return {k: _move_tensors_to(v, device) for k, v in obj.items()}
+    if isinstance(obj, tuple):
+        return tuple(_move_tensors_to(v, device) for v in obj)
+    if isinstance(obj, list):
+        return [_move_tensors_to(v, device) for v in obj]
+    return obj
+
+
+def install_input_transfer_shim(model: Bagel, und_device: str = "cuda:0") -> int:
+    """给 model 的所有 prepare_* 方法装上搬运 shim, 强制其输出 tensor 落到 und_device。
+
+    Args:
+        model: 已 load_model_asym 加载的 Bagel (asym 模式无 accelerate hook, 必须装)。
+        und_device: 输入张量目标设备, 通常 "cuda:0" (主卡)。
+
+    Returns:
+        实际包装的 method 数 (供调用方核对 6 个都装上)。
+    """
+    import functools
+
+    target = torch.device(und_device)
+    n_wrapped = 0
+    for name in _PREPARE_METHODS:
+        if not hasattr(model, name):
+            print(f"[shim] ⚠ {name} not found on model, skipping")
+            continue
+        original = getattr(model, name)
+        if getattr(original, "_asym_shimmed", False):
+            continue  # 重复调用幂等
+
+        @functools.wraps(original)
+        def wrapped(self, *args, _orig=original, _target=target, **kwargs):
+            out = _orig(*args, **kwargs)
+            return _move_tensors_to(out, _target)
+
+        wrapped._asym_shimmed = True
+        # 用 BoundMethod 形式挂到实例上 (覆盖类方法)
+        setattr(model, name, wrapped.__get__(model))
+        n_wrapped += 1
+
+    print(f"[shim] wrapped {n_wrapped} prepare_* methods on model → {und_device}")
+    return n_wrapped
+
+
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="Asymmetric dual-GPU placement loader")
