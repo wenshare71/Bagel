@@ -518,22 +518,31 @@ class PackedAttentionMoT(Qwen2Attention):
             packed_query_states = self.q_norm(packed_query_states)
             packed_key_states = self.k_norm(packed_key_states)
         elif mode == 'gen':
+            # ── asym placement patch (see speedup/starry-purring-moonbeam.md):
+            # gen weights may live on gen_dev (cuda:1) while the main hidden states
+            # stay on main_dev (cuda:0). Move VAE slice to gen_dev once, run all
+            # gen-mode ops there, move results back to main_dev for scatter. `.to()`
+            # is a no-op when source==target, so und mode and co-located (13/15
+            # pipeline) placements are byte-for-byte unchanged. ──
             packed_query_sequence = packed_query_sequence.to(torch.bfloat16)
+            gen_dev = self.q_proj_moe_gen.weight.device
+            main_dev = packed_query_sequence.device
+
+            packed_text_query_sequence = packed_query_sequence[packed_text_indexes]
+            packed_vae_query_sequence = packed_query_sequence[packed_vae_token_indexes].to(gen_dev)
+
             packed_query_states = packed_query_sequence.new_zeros((packed_query_sequence.shape[0], self.num_heads * self.head_dim))
             packed_key_states = packed_query_sequence.new_zeros((packed_query_sequence.shape[0], self.num_key_value_heads * self.head_dim))
             packed_value_states = packed_query_sequence.new_zeros((packed_query_sequence.shape[0], self.num_key_value_heads * self.head_dim))
 
-            packed_text_query_sequence = packed_query_sequence[packed_text_indexes]
-            packed_vae_query_sequence = packed_query_sequence[packed_vae_token_indexes]
-
             packed_query_states[packed_text_indexes] = self.q_proj(packed_text_query_sequence)
-            packed_query_states[packed_vae_token_indexes] = self.q_proj_moe_gen(packed_vae_query_sequence)
+            packed_query_states[packed_vae_token_indexes] = self.q_proj_moe_gen(packed_vae_query_sequence).to(main_dev)
 
             packed_key_states[packed_text_indexes] = self.k_proj(packed_text_query_sequence)
-            packed_key_states[packed_vae_token_indexes] = self.k_proj_moe_gen(packed_vae_query_sequence)
+            packed_key_states[packed_vae_token_indexes] = self.k_proj_moe_gen(packed_vae_query_sequence).to(main_dev)
 
             packed_value_states[packed_text_indexes] = self.v_proj(packed_text_query_sequence)
-            packed_value_states[packed_vae_token_indexes] = self.v_proj_moe_gen(packed_vae_query_sequence)
+            packed_value_states[packed_vae_token_indexes] = self.v_proj_moe_gen(packed_vae_query_sequence).to(main_dev)
 
             packed_query_states = packed_query_states.view(-1, self.num_heads, self.head_dim)
             packed_key_states = packed_key_states.view(-1, self.num_key_value_heads, self.head_dim)
@@ -541,11 +550,11 @@ class PackedAttentionMoT(Qwen2Attention):
 
             packed_query_states = packed_query_states.to(torch.float32)
             packed_query_states[packed_text_indexes] = self.q_norm(packed_query_states[packed_text_indexes])
-            packed_query_states[packed_vae_token_indexes] = self.q_norm_moe_gen(packed_query_states[packed_vae_token_indexes])
+            packed_query_states[packed_vae_token_indexes] = self.q_norm_moe_gen(packed_query_states[packed_vae_token_indexes].to(gen_dev)).to(main_dev)
 
             packed_key_states = packed_key_states.to(torch.float32)
             packed_key_states[packed_text_indexes] = self.k_norm(packed_key_states[packed_text_indexes])
-            packed_key_states[packed_vae_token_indexes] = self.k_norm_moe_gen(packed_key_states[packed_vae_token_indexes])
+            packed_key_states[packed_vae_token_indexes] = self.k_norm_moe_gen(packed_key_states[packed_vae_token_indexes].to(gen_dev)).to(main_dev)
 
         packed_cos, packed_sin = packed_query_position_embeddings
         packed_query_states, packed_key_states = apply_rotary_pos_emb(
@@ -590,8 +599,13 @@ class PackedAttentionMoT(Qwen2Attention):
         if mode == 'und':
             packed_attn_output = self.o_proj(packed_attn_output)
         elif mode == 'gen':
+            # ── asym placement patch: o_proj_moe_gen may be on gen_dev (cuda:1).
+            # Move VAE slice to gen_dev, project, move back. `.to()` is a no-op
+            # when source==target. ──
+            o_gen_dev = self.o_proj_moe_gen.weight.device
+            o_main_dev = packed_attn_output.device
             packed_attn_output[packed_text_indexes] = self.o_proj(packed_attn_output[packed_text_indexes])
-            packed_attn_output[packed_vae_token_indexes] = self.o_proj_moe_gen(packed_attn_output[packed_vae_token_indexes])
+            packed_attn_output[packed_vae_token_indexes] = self.o_proj_moe_gen(packed_attn_output[packed_vae_token_indexes].to(o_gen_dev)).to(o_main_dev)
 
         if update_past_key_values:
             past_key_values.key_cache[self.layer_idx] = merged_key_states
@@ -781,9 +795,13 @@ class Qwen2MoTDecoderLayer(nn.Module):
             if mode == "und":
                 packed_query_sequence = self.input_layernorm(packed_query_sequence)
             elif mode == "gen":
+                # ── asym placement patch: input_layernorm_moe_gen may be on
+                # gen_dev (cuda:1). Move VAE slice to gen_dev, norm, move back. ──
+                ln_dev = self.input_layernorm_moe_gen.weight.device
+                ln_main = packed_query_sequence.device
                 packed_query_sequence_ = torch.zeros_like(packed_query_sequence)
                 packed_query_sequence_[packed_text_indexes] = self.input_layernorm(packed_query_sequence[packed_text_indexes])
-                packed_query_sequence_[packed_vae_token_indexes] = self.input_layernorm_moe_gen(packed_query_sequence[packed_vae_token_indexes])
+                packed_query_sequence_[packed_vae_token_indexes] = self.input_layernorm_moe_gen(packed_query_sequence[packed_vae_token_indexes].to(ln_dev)).to(ln_main)
                 packed_query_sequence = packed_query_sequence_
 
             # Self Attention
@@ -809,14 +827,19 @@ class Qwen2MoTDecoderLayer(nn.Module):
                 packed_query_sequence = self.post_attention_layernorm(packed_query_sequence)
                 packed_query_sequence = self.mlp(packed_query_sequence)
             elif mode == "gen":
+                # ── asym placement patch: post_attention_layernorm_moe_gen and
+                # mlp_moe_gen may both be on gen_dev (cuda:1). Move VAE slice
+                # to gen_dev, norm+mlp there, move result back to main_dev. ──
+                mlp_dev = self.mlp_moe_gen.gate_proj.weight.device
+                mlp_main = packed_query_sequence.device
                 packed_text_query_sequence = packed_query_sequence[packed_text_indexes]
-                packed_vae_query_sequence = packed_query_sequence[packed_vae_token_indexes]
+                packed_vae_query_sequence = packed_query_sequence[packed_vae_token_indexes].to(mlp_dev)
                 packed_text_query_sequence = self.post_attention_layernorm(packed_text_query_sequence).to(torch.bfloat16)
                 packed_vae_query_sequence = self.post_attention_layernorm_moe_gen(packed_vae_query_sequence).to(torch.bfloat16)
 
                 packed_query_sequence_ = torch.zeros_like(packed_query_sequence).to(torch.bfloat16)
                 packed_query_sequence_[packed_text_indexes] = self.mlp(packed_text_query_sequence)
-                packed_query_sequence_[packed_vae_token_indexes] = self.mlp_moe_gen(packed_vae_query_sequence)
+                packed_query_sequence_[packed_vae_token_indexes] = self.mlp_moe_gen(packed_vae_query_sequence).to(mlp_main)
                 packed_query_sequence = packed_query_sequence_
 
             packed_query_sequence = residual + packed_query_sequence
@@ -1076,9 +1099,14 @@ class Qwen2Model(Qwen2PreTrainedModel):
             if mode == "und":
                 packed_query_sequence = self.norm(packed_query_sequence)
             elif mode == "gen":
+                # ── asym placement patch: norm_moe_gen may be on gen_dev (cuda:1).
+                # Move VAE slice to gen_dev, norm, move back. `.to()` no-op when
+                # source==target. ──
+                n_dev = self.norm_moe_gen.weight.device
+                n_main = packed_query_sequence.device
                 packed_query_sequence_ = torch.zeros_like(packed_query_sequence)
                 packed_query_sequence_[packed_text_indexes] = self.norm(packed_query_sequence[packed_text_indexes])
-                packed_query_sequence_[packed_vae_token_indexes] = self.norm_moe_gen(packed_query_sequence[packed_vae_token_indexes])
+                packed_query_sequence_[packed_vae_token_indexes] = self.norm_moe_gen(packed_query_sequence[packed_vae_token_indexes].to(n_dev)).to(n_main)
                 packed_query_sequence = packed_query_sequence_
         else:
             packed_query_sequence = self.norm(packed_query_sequence)
