@@ -8,6 +8,9 @@ outputs/*_outputs*/*
 !outputs/think_res_outputs/t_image_vs_N_per_R.png
 !outputs/think_res_outputs/aggregated.csv
 !outputs/asym_bench_outputs/asym_notebook_trials.csv
+!outputs/asym_bench_outputs/cap_sweep_tokps_vs_cap.png
+!outputs/asym_bench_outputs/cap_sweep_speedup_timage.png
+!outputs/asym_bench_outputs/cap_sweep_gpu_util_think.png
 
 # ── Pre-restructure leftover paths (旧结构，待清理迁移到 outputs/) ──
 think_bottleneck_outputs/
