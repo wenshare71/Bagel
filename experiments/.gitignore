@@ -13,6 +13,8 @@ outputs/*_outputs*/*
 !outputs/asym_bench_outputs/cap_sweep_gpu_util_think.png
 !outputs/kv_length_sweep_outputs/multi_image_sweep_trials.csv
 !outputs/kv_length_sweep_outputs/text_filler_sweep_trials.csv
+!outputs/kv_length_sweep_outputs/kv_sweep_tokps_vs_kvlen.png
+!outputs/kv_length_sweep_outputs/kv_sweep_mem_vs_kvlen.png
 
 # ── Pre-restructure leftover paths (旧结构，待清理迁移到 outputs/) ──
 think_bottleneck_outputs/
